@@ -1,0 +1,285 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ausbon9353355
+
+//@version=5
+strategy("Cross strategy",
+     overlay=true,
+     initial_capital=150000,
+     pyramiding=0,
+     process_orders_on_close=true,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.4)
+
+//=============================
+// Backtest window + direction
+//=============================
+startTime   = input.time(timestamp("2024-01-01T00:00:00"), "Backtest Start")
+endTime     = input.time(timestamp("2030-01-01T00:00:00"), "Backtest End")
+inRange     = time >= startTime and time <= endTime
+
+allowShorts = input.bool(true, "Allow Shorts (off = long-only)")
+
+//=============================
+// Risk profile (2:1 R:R)
+//=============================
+useBrackets     = input.bool(true,  "Use Stop + Take Profit")
+rrMultiple      = input.float(3.0,  "Reward/Risk (TP = RR * Risk)", step=0.25)  // 2.0 = 2:1
+atrLen          = input.int(14,     "ATR Length", minval=1)
+riskATR         = input.float(.9,  "Risk (ATR) for Stop", step=0.1)            // Stop distance = riskATR * ATR
+exitOnOppSignal = input.bool(false,  "Also exit on opposite signal")
+
+atr = ta.atr(atrLen)
+
+//=============================
+// Inputs (your originals)
+//=============================
+fastLen    = input.int(9,  title="Fast EMA", minval=1)
+slowLen    = input.int(21, title="Slow EMA", minval=1)
+macdFast   = input.int(12, title="MACD Fast", minval=1)
+macdSlow   = input.int(26, title="MACD Slow", minval=1)
+macdSignal = input.int(9,  title="MACD Signal", minval=1)
+posPct   = input.float(15, "Position % of equity", step=0.5)
+lev      = input.float(20, "Leverage (e.g., 20 = 20:1)", step=1)
+maxCtr   = input.int(90, "Max contracts", minval=1)
+
+ddLimit   = input.float(9000, "Max Drawdown Limit ($)", step=100)
+ddBuffer  = input.float(500,  "Safety Buffer ($)", step=100)
+slipTicks = input.int(2, "Sizing guard slippage (ticks)", minval=0)
+
+commPerSide = 2.4  // matches your strategy() commission_value
+
+//=============================
+// EMA + MACD
+//=============================
+fastEMA = ta.ema(close, fastLen)
+slowEMA = ta.ema(close, slowLen)
+
+// === Higher TF Trend Filter (cuts trades / commissions) ===
+useHTFTrendFilter = input.bool(true, "Use Higher TF Trend Filter")
+htf = input.timeframe("60", "Higher TF (e.g., 60=1H)")
+
+htfFast = request.security(syminfo.tickerid, htf, ta.ema(close, fastLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfSlow = request.security(syminfo.tickerid, htf, ta.ema(close, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+htfTrendUp = htfFast >= htfSlow
+
+[macdLine, signalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+emaCrossUp   = ta.crossover(fastEMA, slowEMA)
+emaCrossDown = ta.crossunder(fastEMA, slowEMA)
+
+macdCrossUp   = ta.crossover(macdLine, signalLine)
+macdCrossDown = ta.crossunder(macdLine, signalLine)
+
+//=============================
+// Your original OR signals
+//=============================
+trendUp  = fastEMA > slowEMA
+buySignal = trendUp and macdCrossUp
+trendDown   = fastEMA < slowEMA
+shortSignal = trendDown and macdCrossDown
+
+
+//=============================
+// Chop filter (ADX + Volume) + background
+//=============================
+useChopFilterForEntries = input.bool(true, "Block ENTRIES during chop")
+
+volAvgLength = input.int(20, minval=1, title="Volume SMA Length for Chop")
+volMA_chop   = ta.sma(volume, volAvgLength)
+volQuiet     = volume < volMA_chop * 0.8
+
+adxThreshold_chop = input.float(15.0, title="ADX Threshold for Chop Detection")
+adxPeriod         = input.int(15, minval=1, title="ADX Period")
+adxSmoothing      = input.int(14, minval=1, title="ADX Smoothing")
+[diPlus, diMinus, adx] = ta.dmi(adxPeriod, adxSmoothing)
+
+chopCondition = (adx < adxThreshold_chop) and volQuiet
+
+showChopBG  = input.bool(true, title="Show Chop Background Highlight")
+chopBGColor = input.color(color.new(color.red, 85), title="Chop Background Color")
+bgcolor(showChopBG and chopCondition ? chopBGColor : na)
+
+// Chop filter applies to ENTRIES ONLY
+tradeAllowed = not (useChopFilterForEntries and chopCondition)
+
+// === Cooldown (only after LOSS by default) ===
+useCooldown       = input.bool(true, "Use Entry Cooldown")
+cooldownLossBars  = input.int(10, "Cooldown Bars After LOSS", minval=0)
+cooldownWinBars   = input.int(0,  "Cooldown Bars After WIN",  minval=0)
+
+var int lastExitBar = na
+var int lastCdBars  = 0
+
+canEnter = (not useCooldown) or na(lastExitBar) or (bar_index - lastExitBar >= lastCdBars)
+
+// === Position sizing (contracts) ===
+contractNotional = close * syminfo.pointvalue
+targetNotional   = strategy.equity * (posPct / 100) * lev
+
+contracts = math.floor(targetNotional / contractNotional)
+contracts := math.min(contracts, maxCtr)
+contracts := math.max(contracts, 0)
+
+// worst-case loss per contract (stop + slippage + commissions)
+riskPrice = riskATR * atr
+slipPrice = slipTicks * syminfo.mintick
+
+lossPerContract = (riskPrice + slipPrice) * syminfo.pointvalue + (2 * commPerSide)
+
+// Desired contracts (your normal sizing + prop cap)
+contractsDesired = contracts
+
+// Worst-case loss for NEXT trade at desired size
+worstCaseNextTrade = lossPerContract * contractsDesired
+
+// === HARD FLOOR (you manually bump this after payout) ===
+// 0 = auto floor = initial_capital - ddLimit (150000 - 9000 = 141000)
+manualFloor = input.float(0.0, "Manual Floor ($) (0 = auto)", step=100)
+
+autoFloor   = strategy.initial_capital - ddLimit
+floorEquity = manualFloor > 0 ? manualFloor : autoFloor
+
+// Cushion above the floor right now
+floorRem = strategy.equity - floorEquity
+
+// Lockout if next trade worst-case could breach the FLOOR
+floorLockout = (floorRem - ddBuffer) < worstCaseNextTrade
+
+
+// === DAILY DRAWDOWN (resets each prop trading day: 17:00 Chicago -> 16:00 Chicago) ===
+dailyLimit = input.float(9000, "Daily Drawdown Limit ($)", step=100)
+dailyMode  = input.string("Trailing from session peak", "Daily DD Mode",
+     options=["Trailing from session peak", "From session start"])
+
+// Session definition (keep yours)
+propSess = input.session("1700-1600", "Prop Trading Day Session")
+propTZ   = input.string("America/Chicago", "Prop Session Timezone")
+sessTime = time(timeframe.period, propSess, propTZ)
+inSess   = not na(sessTime)
+
+// Robust “new day” detector: shift time by 17h and use local date as the key
+resetHour = input.int(17, "Daily reset hour (Chicago)", minval=0, maxval=23)
+resetMin  = input.int(0,  "Daily reset minute", minval=0, maxval=59)
+shiftMs   = (resetHour * 60 + resetMin) * 60 * 1000
+// Shift so 17:00 -> 00:00 (24 - 17 = 7 hours)
+tShift  = time + shiftMs
+
+// Day key in propTZ (YYYYMMDD)
+dayKey = year(tShift, propTZ) * 10000 + month(tShift, propTZ) * 100 + dayofmonth(tShift, propTZ)
+
+// “New prop day” flag (first bar after 17:00 CST boundary)
+newSess = dayKey != dayKey[1]
+
+
+// Track session anchors
+var float dayStartEq = na
+var float dayPeakEq  = na
+
+if inSess and (newSess or not inSess[1])
+    dayStartEq := strategy.equity
+    dayPeakEq  := strategy.equity
+else if inSess
+    dayStartEq := nz(dayStartEq, strategy.equity)
+    dayPeakEq  := math.max(nz(dayPeakEq, strategy.equity), strategy.equity)
+else
+    // optional: clear when out of session
+    dayStartEq := na
+    dayPeakEq  := na
+
+// Current daily drawdown inside the prop session
+dayDD   = inSess ? (dailyMode == "Trailing from session peak" ? (dayPeakEq - strategy.equity) : (dayStartEq - strategy.equity)) : 0.0
+dailyRem = dailyLimit - dayDD
+
+
+// Lockout if next trade worst-case could breach the DAILY limit
+dailyLockout = inSess and ((dailyRem - ddBuffer) < worstCaseNextTrade)
+
+
+// Combined entry gate (block entries if EITHER rule would be violated)
+ddLockout = floorLockout or dailyLockout
+
+
+
+// Entries / Exits (IMPORTANT: exits are never blocked by chop)
+//=============================
+buyEntry  = inRange and inSess and tradeAllowed and buySignal and (not useHTFTrendFilter or htfTrendUp)
+sellEntry = inRange and inSess and tradeAllowed and shortSignal
+
+// Opposite-signal exits
+sellExit = inRange and shortSignal   // bearish => close LONG
+buyExit  = inRange and buySignal     // bullish => close SHORT
+
+// Entries
+if buyEntry and not ddLockout and canEnter and strategy.position_size == 0 and contractsDesired >= 1
+    strategy.entry("L", strategy.long, qty=contractsDesired)
+
+if allowShorts and sellEntry and not ddLockout and canEnter and strategy.position_size == 0 and contractsDesired >= 1
+    strategy.entry("S", strategy.short, qty=contractsDesired)
+
+// Optional exit on opposite signal
+if exitOnOppSignal and sellExit
+    strategy.close("L")
+
+if exitOnOppSignal and buyExit
+    strategy.close("S")
+
+// Bracket exits (2:1 default)
+if useBrackets
+    risk = riskATR * atr
+
+    if strategy.position_size > 0
+        longStop  = strategy.position_avg_price - risk
+        longLimit = strategy.position_avg_price + rrMultiple * risk
+        strategy.exit("L-TP/SL", from_entry="L", stop=longStop, limit=longLimit)
+// Mark exit bar (start cooldown after you flatten)
+    if strategy.position_size < 0
+        shortStop  = strategy.position_avg_price + risk
+        shortLimit = strategy.position_avg_price - rrMultiple * risk
+        strategy.exit("S-TP/SL", from_entry="S", stop=shortStop, limit=shortLimit)
+
+qualifiedLong = buyEntry and not ddLockout and canEnter and strategy.position_size == 0 and contractsDesired >= 1
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastExitBar := bar_index
+
+    float lastPnL = na
+    if strategy.closedtrades > 0
+        lastPnL := strategy.closedtrades.profit(strategy.closedtrades - 1)
+
+    lastCdBars := (na(lastPnL) or lastPnL < 0) ? cooldownLossBars : cooldownWinBars
+
+if buySignal and not qualifiedLong
+    labelText =
+         "No entry\n" +
+         "inRange: " + str.tostring(inRange) + "\n" +
+         "tradeAllowed: " + str.tostring(tradeAllowed) + "\n" +
+         "chop: " + str.tostring(chopCondition) + "\n" +
+         "canEnter: " + str.tostring(canEnter) + "\n" +
+         "inPos: " + str.tostring(strategy.position_size != 0) + "\n" +
+         "buyEntry: " + str.tostring(buyEntry) + "\n" +
+         "ddLockout: " + str.tostring(ddLockout) + "\n" +
+         "inSess: " + str.tostring(inSess) + "\n" +
+         "useHTF: " + str.tostring(useHTFTrendFilter) + "\n" +
+         "htfTrendUp: " + str.tostring(htfTrendUp) + "\n" +
+         "floorEquity: " + str.tostring(floorEquity) + "\n" +
+         "floorRem: " + str.tostring(floorRem) + "\n" +
+         "dayDD: " + str.tostring(dayDD) + "\n" +
+         "dailyRem: " + str.tostring(dailyRem) + "\n" +
+         "floorLockout: " + str.tostring(floorLockout) + "\n" +
+         "dailyLockout: " + str.tostring(dailyLockout) + "\n" +
+         "contracts: " + str.tostring(contractsDesired)
+         
+
+    label.new(bar_index, high, labelText, style=label.style_label_down, textcolor=color.white)
+
+//=============================
+// Plots + shapes + alerts (your originals)
+//=============================
+plot(fastEMA, color=color.blue, title="Fast EMA")
+plot(slowEMA, color=color.orange, title="Slow EMA")
+
+plotshape(buySignal,  title="Buy",  location=location.belowbar, color=color.green, style=shape.triangleup,   size=size.small)
+plotchar(contractsDesired, title="Contracts", char="•", location=location.top)
+alertcondition(buySignal,  title="Buy Signal",  message="Buy Signal Triggered")
+alertcondition(shortSignal, title="Sell Signal", message="Sell Signal Triggered")
