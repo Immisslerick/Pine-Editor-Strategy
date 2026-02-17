@@ -1,0 +1,114 @@
+# Cross Strategy (Pine Script) — EMA/MACD + ATR Brackets + Prop-Style Risk Controls
+
+Systematic futures strategy implemented in **Pine Script v5** for TradingView.  
+Primary goal: convert discretionary-style signals into a **repeatable, testable strategy** with explicit entries/exits, realistic execution costs, and prop-firm style drawdown constraints.
+
+> **Note:** Current results and tuning were focused on **Micro Gold (MGC1)**. Early testing showed the same parameters did **not** generalize to MBT1/MES1/SIL1 without retuning, which suggests the edge is **instrument / market-structure specific**.
+
+---
+
+## Strategy Summary
+
+### Signal Logic
+- **Long bias**
+  - Trend confirmation: `Fast EMA > Slow EMA`
+  - Trigger: **MACD line crosses above MACD signal**
+- **Short bias**
+  - Trend confirmation: `Fast EMA < Slow EMA`
+  - Trigger: **MACD line crosses below MACD signal**
+
+### Risk / Exits
+- Bracket order model using ATR:
+  - **Stop-loss** = `riskATR × ATR`
+  - **Take-profit** = `rrMultiple × Stop distance`
+- Optional “exit on opposite signal” (off by default)
+
+### Entry Filters (to reduce churn)
+- **Chop filter (entries only)** using:
+  - ADX below threshold AND
+  - Volume below SMA(volume) × factor
+- Optional HTF trend filter (can be enabled/disabled)
+
+### Position Sizing
+- Notional sizing based on equity:
+  - `contractsDesired = floor((equity × posPct × leverage) / (price × pointvalue))`
+- Hard cap via `maxCtr` (used to align with prop limits, e.g., 6 contracts)
+
+---
+
+## Prop-Style Risk Controls (Key Feature)
+
+This project includes two independent constraints used to **block new entries** when the next worst-case stop-out could violate rules:
+
+1) **Daily drawdown limit** (resets each “prop trading day”)
+- Prop day assumed: **17:00 CST → 16:00 CST**
+- Tracks either:
+  - drawdown from **session start**, or
+  - drawdown from **session equity peak** (trailing)
+
+2) **Hard equity floor** (manual, for post-payout behavior)
+- Default floor: `initial_capital - ddLimit` (e.g., 150,000 - 9,000 = **141,000**)
+- When a payout occurs, user can set `manualFloor` to the new fixed floor
+  - Example: after payout, floor can be manually bumped to **150,100**
+- This is intentionally manual because payout timing is user-controlled.
+
+**Important:** TradingView’s “Max equity drawdown” stat is **peak-to-valley across the whole backtest** and may not match prop definitions that reset daily. This strategy logs and enforces the prop rules internally.
+
+---
+
+## How To Run
+
+1. Open TradingView → Pine Editor  
+2. Paste the script into the editor and click **Add to chart**
+3. Open **Strategy Tester** and set:
+   - Symbol: **MGC1** (recommended baseline)
+   - Time range: Aug 31, 2025 → present (or your preferred window)
+   - Commission: **$2.40 per contract** (cash per contract)
+   - Slippage: set in TradingView settings if you want to simulate fills
+
+---
+
+## Key Parameters
+
+| Parameter | Meaning |
+|---|---|
+| `riskATR` | Stop distance in ATR multiples |
+| `rrMultiple` | Reward/Risk multiple (TP = RR × Stop) |
+| `posPct` | Percent of equity allocated to notional sizing |
+| `lev` | Leverage multiplier used for sizing model |
+| `maxCtr` | Maximum contracts allowed |
+| `ddLimit` | Drawdown limit (used for floor + daily limits) |
+| `manualFloor` | Set this after payout (0 = auto floor) |
+| `propSess / propTZ` | Defines prop trading day window and timezone |
+| `useChopFilterForEntries` | Blocks entries in low-trend/low-volume regimes |
+| `useHTFTrendFilter` | Optional higher-timeframe trend confirmation |
+
+---
+
+## Results & Status
+
+- Current backtesting and tuning focused on **MGC1**.
+- Early cross-symbol testing showed the same parameters were not profitable on:
+  - MBT1, MES1, SIL1 (without retuning)
+- This repo is intended as:
+  1) A **reproducible backtest artifact** (for portfolio/resume proof), and  
+  2) A base strategy to iterate toward a live trading ruleset.
+
+> If you use this live: treat it as a starting point, validate with forward testing, and tune execution assumptions (slippage, spreads, session hours) for your venue.
+
+---
+
+## Roadmap / Next Tests
+
+- Add walk-forward style testing (rolling windows)
+- Add “spike dependence” sanity tests (exclude large outlier weeks/months)
+- Compare chop filter variants:
+  - ADX-only vs ADX+volume
+- Add optional volatility regime filter (ATR% bands)
+- Improve size tapering near daily DD limits (reduce contracts rather than full lockout)
+
+---
+
+## Disclaimer
+
+This code is for research/education. Backtests are sensitive to execution assumptions and do not guarantee future performance. Use at your own risk.
